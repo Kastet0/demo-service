@@ -1,0 +1,92 @@
+pipeline {
+    agent any
+
+    // Параметр: при запуске Jenkins спросит, какой тег деплоить
+    parameters {
+        string(name: 'TAG', defaultValue: 'latest',
+               description: 'Тег образа demo-service для деплоя (номер сборки или latest)')
+    }
+
+    environment {
+        REGISTRY = '192.168.56.10:8082'
+        APP_HOST = '192.168.56.20'
+        APP_USER = 'vboxuser'
+        APP_DIR  = 'demo-service'                          // папка в домашнем каталоге на app
+        SSH_OPTS = '-o StrictHostKeyChecking=accept-new'   // см. разбор ниже
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Нужен ради deploy/docker-compose.yml из репозитория
+                checkout scm
+            }
+        }
+
+        stage('Copy compose file') {
+            steps {
+                // sshagent временно «вставляет» ключ app-ssh — только внутри блока
+                sshagent(['app-ssh']) {
+                    sh '''
+                        ssh $SSH_OPTS $APP_USER@$APP_HOST "mkdir -p $APP_DIR"
+                        scp $SSH_OPTS deploy/docker-compose.yml $APP_USER@$APP_HOST:$APP_DIR/docker-compose.yml
+                        ssh $SSH_OPTS $APP_USER@$APP_HOST "echo TAG=$TAG > $APP_DIR/.env"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                withCredentials([usernamePassword(
+                        credentialsId: 'nexus-creds',
+                        usernameVariable: 'NEXUS_USER',
+                        passwordVariable: 'NEXUS_PASS')]) {
+                    sshagent(['app-ssh']) {
+                        sh '''
+                            echo "$NEXUS_PASS" | ssh $SSH_OPTS $APP_USER@$APP_HOST "docker login $REGISTRY -u $NEXUS_USER --password-stdin"
+                            ssh $SSH_OPTS $APP_USER@$APP_HOST "cd $APP_DIR && docker compose pull && docker compose up -d"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Health check') {
+            steps {
+                sshagent(['app-ssh']) {
+                    sh '''
+                        for i in $(seq 1 12); do
+                            if ssh $SSH_OPTS $APP_USER@$APP_HOST "curl -fs localhost:8080/actuator/health"; then
+                                echo ""
+                                echo "Сервис поднялся"
+                                exit 0
+                            fi
+                            echo "Ждём старта сервиса ($i/12)..."
+                            sleep 5
+                        done
+                        echo "Сервис не поднялся за 60 секунд"
+                        exit 1
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Задеплоено: demo-service:${params.TAG} на ${APP_HOST}"
+        }
+        failure {
+            // При ошибке показать последние логи контейнера, чтобы сразу видеть причину
+            sshagent(['app-ssh']) {
+                sh 'ssh $SSH_OPTS $APP_USER@$APP_HOST "cd $APP_DIR && docker compose logs --tail=50" || true'
+            }
+        }
+    }
+}

@@ -1,0 +1,12 @@
+services:
+  demo-service:
+    # Образ из Nexus. Тег берётся из переменной TAG (из файла .env рядом),
+    # если её нет — latest
+    image: 192.168.56.10:8082/demo-service:${TAG:-latest}
+    container_name: demo-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Наш код показывает эту версию в ответе на /
+      - APP_VERSION=${TAG:-latest}
